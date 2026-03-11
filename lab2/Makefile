@@ -1,16 +1,13 @@
-CC = gcc
-CFLAGS = -Wall -std=c11
-LIBS = -lpthread
+CC = g++
+FLAGS = -std=c++17 -Wall
 
 all: server client
 
-server: server.c utils.c message.h
-	$(CC) $(CFLAGS) -o server.exe server.c utils.c $(LIBS)
+server: server.cpp
+	$(CC) $(FLAGS) -o server server.cpp
 
-client: client.c utils.c message.h
-	$(CC) $(CFLAGS) -o client.exe client.c utils.c $(LIBS)
+client: client.cpp
+	$(CC) $(FLAGS) -o client client.cpp
 
 clean:
-	rm -f server client *.o
-
-.PHONY: all clean
+	rm -f server client
