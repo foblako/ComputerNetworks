@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cstring>
 #include <csignal>
+#include <cstdint>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -122,8 +123,7 @@ void broadcast_message(const char *sender_addr, const char *text) {
 
 // Обработка клиента в рабочем потоке
 void* client_handler(void *arg) {
-    int client_fd = *(int*)arg;
-    delete (int*)arg;
+    int client_fd = (intptr_t)arg;
     
     sockaddr_in caddr{};
     socklen_t clen = sizeof(caddr);
