@@ -1,20 +1,19 @@
 #include <iostream>
 #include <cstring>
+#include <string>
 #include <csignal>
 #include <cstdint>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <stdint.h>
 #include <pthread.h>
 #include <queue>
 #include <vector>
-#include <map>
 
 #define MAX_PAYLOAD 1024
 #define PORT 9090
-#define THREAD_POOL_SIZE 10
+#define POOL_SIZE 10
 
 typedef struct {
     uint32_t length;
@@ -31,22 +30,20 @@ enum {
     MSG_BYE     = 6
 };
 
-// Информация о клиенте
-struct ClientInfo {
-    int socket;
-    char nick[64];
-    char addr_str[64];
+struct Client {
+    int fd;
+    std::string nick;
+    std::string addr;
 };
 
 // Глобальные данные
-std::queue<int> connection_queue;
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
+static std::queue<int> q;
 
-std::map<int, ClientInfo> clients;
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-bool server_running = true;
+static pthread_mutex_t cli_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t print_mu = PTHREAD_MUTEX_INITIALIZER;
+static std::vector<Client> clients;
 
 // Чтение ровно n байт из сокета
 int recv_all(int fd, void *buf, size_t n) {
@@ -85,7 +82,7 @@ int recv_msg(int fd, Message *msg) {
     uint32_t nl;
     if (recv_all(fd, &nl, 4) < 0) return -1;
     msg->length = ntohl(nl);
-    if (msg->length < 1 || msg->length > MAX_PAYLOAD + 1) return -1;
+    if (msg->length < 1 || msg->length > MAX_PAYLOAD) return -1;
     if (recv_all(fd, &msg->type, 1) < 0) return -1;
     uint32_t plen = msg->length - 1;
     if (plen > 0) {
@@ -95,201 +92,179 @@ int recv_msg(int fd, Message *msg) {
     return 0;
 }
 
-// Широковещательная рассылка всем клиентам
-void broadcast_message(const char *sender_addr, const char *text) {
-    pthread_mutex_lock(&clients_mutex);
-    
-    char message[1024];
-    snprintf(message, sizeof(message), "%s: %s", sender_addr, text);
-    
-    std::vector<int> to_remove;
-    
-    for (auto& pair : clients) {
-        int client_fd = pair.first;
-        if (send_msg(client_fd, MSG_TEXT, message, strlen(message)) < 0) {
-            to_remove.push_back(client_fd);
+// Удаление клиента из списка
+static void remove_client(int fd) {
+    pthread_mutex_lock(&cli_mu);
+    for (size_t i = 0; i < clients.size(); i++) {
+        if (clients[i].fd == fd) {
+            pthread_mutex_lock(&print_mu);
+            std::cout << "Client disconnected: " << clients[i].nick
+                      << " [" << clients[i].addr << "]" << std::endl;
+            pthread_mutex_unlock(&print_mu);
+            close(fd);
+            clients.erase(clients.begin() + (long)i);
+            break;
         }
     }
-    
-    // Удаление отключившихся клиентов
-    for (int fd : to_remove) {
-        std::cout << "Client disconnected: " << clients[fd].nick << " [" << clients[fd].addr_str << "]" << std::endl;
-        close(fd);
-        clients.erase(fd);
-    }
-    
-    pthread_mutex_unlock(&clients_mutex);
+    pthread_mutex_unlock(&cli_mu);
 }
 
-// Обработка клиента в рабочем потоке
-void* client_handler(void *arg) {
-    int client_fd = (intptr_t)arg;
+// Широковещательная рассылка
+static void broadcast_line(const std::string &line) {
+    std::vector<int> dead;
+    pthread_mutex_lock(&cli_mu);
+    for (auto &c : clients) {
+        if (send_msg(c.fd, MSG_TEXT, line.c_str(), (uint32_t)line.size()) < 0)
+            dead.push_back(c.fd);
+    }
+    pthread_mutex_unlock(&cli_mu);
+    for (int fd : dead)
+        remove_client(fd);
+}
+
+// Обработка сессии клиента
+static void handle_session(int fd) {
+    sockaddr_in peer{};
+    socklen_t plen = sizeof(peer);
+    char addrbuf[64];
     
-    sockaddr_in caddr{};
-    socklen_t clen = sizeof(caddr);
-    getpeername(client_fd, (sockaddr*)&caddr, &clen);
-    
-    char addr_str[64];
-    snprintf(addr_str, sizeof(addr_str), "%s:%d",
-             inet_ntoa(caddr.sin_addr), ntohs(caddr.sin_port));
-    
+    if (getpeername(fd, (sockaddr*)&peer, &plen) == 0) {
+        char ipstr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
+        snprintf(addrbuf, sizeof(addrbuf), "%s:%d", ipstr, ntohs(peer.sin_port));
+    } else {
+        snprintf(addrbuf, sizeof(addrbuf), "?");
+    }
+
     Message msg{};
     
     // Ожидание MSG_HELLO
-    if (recv_msg(client_fd, &msg) < 0 || msg.type != MSG_HELLO) {
-        std::cerr << "No HELLO from " << addr_str << std::endl;
-        close(client_fd);
-        return nullptr;
+    if (recv_msg(fd, &msg) < 0 || msg.type != MSG_HELLO) {
+        close(fd);
+        return;
     }
-    
-    // Сохранение ника
-    ClientInfo info{};
-    info.socket = client_fd;
-    strncpy(info.nick, msg.payload, sizeof(info.nick) - 1);
-    info.nick[sizeof(info.nick) - 1] = '\0';
-    strncpy(info.addr_str, addr_str, sizeof(info.addr_str) - 1);
-    info.addr_str[sizeof(info.addr_str) - 1] = '\0';
-    
+
+    std::string nick(msg.payload);
+    if (nick.empty()) nick = "anon";
+
     // Отправка MSG_WELCOME
-    if (send_msg(client_fd, MSG_WELCOME, addr_str, strlen(addr_str)) < 0) {
-        close(client_fd);
-        return nullptr;
+    if (send_msg(fd, MSG_WELCOME, addrbuf, strlen(addrbuf)) < 0) {
+        close(fd);
+        return;
     }
-    
+
     // Добавление в список клиентов
-    pthread_mutex_lock(&clients_mutex);
-    clients[client_fd] = info;
-    pthread_mutex_unlock(&clients_mutex);
-    
-    std::cout << "Client connected: " << info.nick << " [" << addr_str << "]" << std::endl;
-    
-    // Основной цикл обработки сообщений
+    Client me{};
+    me.fd = fd;
+    me.nick = nick;
+    me.addr = addrbuf;
+
+    pthread_mutex_lock(&cli_mu);
+    clients.push_back(me);
+    pthread_mutex_unlock(&cli_mu);
+
+    pthread_mutex_lock(&print_mu);
+    std::cout << "Client connected: " << nick << " [" << addrbuf << "]" << std::endl;
+    pthread_mutex_unlock(&print_mu);
+
+    // Основной цикл обработки
     while (true) {
         memset(&msg, 0, sizeof(msg));
-        if (recv_msg(client_fd, &msg) < 0) {
-            std::cout << "Client disconnected: " << info.nick << " [" << addr_str << "]" << std::endl;
-            break;
+        if (recv_msg(fd, &msg) < 0) {
+            remove_client(fd);
+            return;
         }
         
         if (msg.type == MSG_TEXT) {
-            broadcast_message(addr_str, msg.payload);
+            uint32_t tlen = msg.length > 1 ? msg.length - 1 : 0;
+            std::string line = nick + " [" + addrbuf + "]: ";
+            line.append(msg.payload, tlen);
+            broadcast_line(line);
         } else if (msg.type == MSG_PING) {
-            send_msg(client_fd, MSG_PONG, nullptr, 0);
+            if (send_msg(fd, MSG_PONG, nullptr, 0) < 0) {
+                remove_client(fd);
+                return;
+            }
         } else if (msg.type == MSG_BYE) {
-            std::cout << "Client disconnected: " << info.nick << " [" << addr_str << "]" << std::endl;
-            break;
+            remove_client(fd);
+            return;
         }
     }
-    
-    // Удаление клиента из списка
-    pthread_mutex_lock(&clients_mutex);
-    close(client_fd);
-    clients.erase(client_fd);
-    pthread_mutex_unlock(&clients_mutex);
-    
-    return nullptr;
 }
 
 // Рабочий поток пула
-void* worker_thread(void *arg) {
+static void *worker(void *arg) {
     (void)arg;
-    
-    while (server_running) {
-        pthread_mutex_lock(&queue_mutex);
-        
-        // Ожидание появления соединения в очереди
-        while (connection_queue.empty() && server_running) {
-            pthread_cond_wait(&queue_cond, &queue_mutex);
-        }
-        
-        if (!server_running && connection_queue.empty()) {
-            pthread_mutex_unlock(&queue_mutex);
-            break;
-        }
-        
-        // Извлечение сокета из очереди
-        int client_fd = connection_queue.front();
-        connection_queue.pop();
-        
-        pthread_mutex_unlock(&queue_mutex);
-        
-        // Обработка клиента
-        client_handler((void*)(intptr_t)client_fd);
+    for (;;) {
+        pthread_mutex_lock(&q_mu);
+        while (q.empty())
+            pthread_cond_wait(&q_cv, &q_mu);
+        int fd = q.front();
+        q.pop();
+        pthread_mutex_unlock(&q_mu);
+        handle_session(fd);
     }
-    
     return nullptr;
 }
 
 int main() {
     signal(SIGPIPE, SIG_IGN);
-    
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
+
+    int sd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sd < 0) {
         perror("socket");
         return 1;
     }
     
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+    setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     sockaddr_in saddr{};
     saddr.sin_family = AF_INET;
     saddr.sin_port = htons(PORT);
     saddr.sin_addr.s_addr = INADDR_ANY;
-    
-    if (bind(server_fd, (sockaddr*)&saddr, sizeof(saddr)) < 0) {
+
+    if (bind(sd, (sockaddr*)&saddr, sizeof(saddr)) < 0) {
         perror("bind");
-        close(server_fd);
+        close(sd);
         return 1;
     }
     
-    if (listen(server_fd, 10) < 0) {
+    if (listen(sd, 32) < 0) {
         perror("listen");
-        close(server_fd);
+        close(sd);
         return 1;
     }
-    
-    std::cout << "TCP server running on port " << PORT << std::endl;
-    std::cout << "Thread pool size: " << THREAD_POOL_SIZE << std::endl;
-    
+
     // Создание пула потоков
-    pthread_t threads[THREAD_POOL_SIZE];
-    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
-        if (pthread_create(&threads[i], nullptr, worker_thread, nullptr) != 0) {
-            std::cerr << "Failed to create thread " << i << std::endl;
-        } else {
-            pthread_detach(threads[i]);
+    pthread_t th[POOL_SIZE];
+    for (int i = 0; i < POOL_SIZE; i++) {
+        if (pthread_create(&th[i], nullptr, worker, nullptr) != 0) {
+            perror("pthread_create");
+            close(sd);
+            return 1;
         }
+        pthread_detach(th[i]);
     }
-    
-    std::cout << "Thread pool created" << std::endl;
-    
+
+    pthread_mutex_lock(&print_mu);
+    std::cout << "TCP server running on port " << PORT << std::endl;
+    std::cout << "Thread pool size: " << POOL_SIZE << std::endl;
+    pthread_mutex_unlock(&print_mu);
+
     // Главный цикл: приём соединений
-    while (server_running) {
+    for (;;) {
         sockaddr_in caddr{};
         socklen_t clen = sizeof(caddr);
-        int client_fd = accept(server_fd, (sockaddr*)&caddr, &clen);
-        
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
+        int cd = accept(sd, (sockaddr*)&caddr, &clen);
+        if (cd < 0) {
             perror("accept");
             continue;
         }
         
-        // Добавление сокета в очередь
-        pthread_mutex_lock(&queue_mutex);
-        connection_queue.push(client_fd);
-        pthread_cond_signal(&queue_cond);
-        pthread_mutex_unlock(&queue_mutex);
+        pthread_mutex_lock(&q_mu);
+        q.push(cd);
+        pthread_cond_signal(&q_cv);
+        pthread_mutex_unlock(&q_mu);
     }
-    
-    // Остановка сервера
-    pthread_mutex_lock(&queue_mutex);
-    server_running = false;
-    pthread_cond_broadcast(&queue_cond);
-    pthread_mutex_unlock(&queue_mutex);
-    
-    close(server_fd);
-    
-    return 0;
 }

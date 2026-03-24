@@ -1,17 +1,18 @@
 #include <iostream>
 #include <cstring>
+#include <string>
+#include <atomic>
+#include <pthread.h>
 #include <csignal>
+#include <unistd.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <stdint.h>
-#include <pthread.h>
-#include <atomic>
 
 #define MAX_PAYLOAD 1024
-#define PORT 9090
-#define RECONNECT_DELAY 2
+#define RECONNECT_SEC 2
 
 typedef struct {
     uint32_t length;
@@ -28,11 +29,9 @@ enum {
     MSG_BYE     = 6
 };
 
-// Глобальные переменные
-std::atomic<int> client_socket(-1);
-std::atomic<bool> client_running(true);
-std::atomic<bool> connected(false);
-pthread_mutex_t socket_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::atomic<int> g_sd{-1};
+static std::atomic<bool> g_run{true};
+static pthread_mutex_t print_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // Чтение ровно n байт из сокета
 int recv_all(int fd, void *buf, size_t n) {
@@ -71,7 +70,7 @@ int recv_msg(int fd, Message *msg) {
     uint32_t nl;
     if (recv_all(fd, &nl, 4) < 0) return -1;
     msg->length = ntohl(nl);
-    if (msg->length < 1 || msg->length > MAX_PAYLOAD + 1) return -1;
+    if (msg->length < 1 || msg->length > MAX_PAYLOAD) return -1;
     if (recv_all(fd, &msg->type, 1) < 0) return -1;
     uint32_t plen = msg->length - 1;
     if (plen > 0) {
@@ -81,206 +80,183 @@ int recv_msg(int fd, Message *msg) {
     return 0;
 }
 
-// Поток приёма сообщений от сервера
-void* receive_thread(void *arg) {
-    (void)arg;
-    Message msg{};
-    
-    while (client_running) {
-        if (!connected) {
+// Поток приёма сообщений
+static void *recv_thread(void *arg) {
+    const char *nick = (const char *)arg;
+    (void)nick;
+
+    while (g_run.load()) {
+        int fd = g_sd.load();
+        if (fd < 0) {
             usleep(100000);
             continue;
         }
-        
-        pthread_mutex_lock(&socket_mutex);
-        int sock = client_socket.load();
-        pthread_mutex_unlock(&socket_mutex);
-        
-        if (sock < 0) {
-            usleep(100000);
+        Message msg{};
+        if (recv_msg(fd, &msg) < 0) {
+            if (!g_run.load())
+                break;
+            int expected = fd;
+            if (g_sd.compare_exchange_strong(expected, -1)) {
+                shutdown(fd, SHUT_RDWR);
+                close(fd);
+                pthread_mutex_lock(&print_mu);
+                std::cout << "(connection lost, reconnecting...)" << std::endl;
+                pthread_mutex_unlock(&print_mu);
+            }
             continue;
         }
-        
-        memset(&msg, 0, sizeof(msg));
-        if (recv_msg(sock, &msg) < 0) {
-            std::cout << "\n[Disconnected from server]" << std::endl;
-            connected = false;
-            continue;
-        }
-        
         if (msg.type == MSG_TEXT) {
-            std::cout << "\n" << msg.payload << std::endl;
+            pthread_mutex_lock(&print_mu);
+            std::cout << msg.payload << std::endl;
+            pthread_mutex_unlock(&print_mu);
         } else if (msg.type == MSG_PONG) {
-            std::cout << "[PONG]" << std::endl;
+            pthread_mutex_lock(&print_mu);
+            std::cout << "PONG" << std::endl;
+            pthread_mutex_unlock(&print_mu);
         } else if (msg.type == MSG_WELCOME) {
-            std::cout << "[Connected to server: " << msg.payload << "]" << std::endl;
+            pthread_mutex_lock(&print_mu);
+            std::cout << "Welcome " << msg.payload << std::endl;
+            pthread_mutex_unlock(&print_mu);
         } else if (msg.type == MSG_BYE) {
-            std::cout << "[Server sent BYE]" << std::endl;
-            connected = false;
+            pthread_mutex_lock(&print_mu);
+            std::cout << "Disconnected" << std::endl;
+            pthread_mutex_unlock(&print_mu);
+            g_run.store(false);
+            break;
         }
     }
-    
     return nullptr;
 }
 
-// Подключение к серверу с handshake
-int connect_to_server() {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
+// Подключение к серверу
+static bool do_connect(const char *host, const char *nick) {
+    int sd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sd < 0) {
         perror("socket");
-        return -1;
+        return false;
     }
-    
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
-    
-    if (connect(sock, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        close(sock);
-        return -1;
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(9090);
+    if (inet_pton(AF_INET, host, &dest.sin_addr) != 1) {
+        close(sd);
+        return false;
     }
-    
-    // Отправка MSG_HELLO с ником
-    const char *nick = "User";
-    if (send_msg(sock, MSG_HELLO, nick, strlen(nick)) < 0) {
-        close(sock);
-        return -1;
+    if (connect(sd, (sockaddr*)&dest, sizeof(dest)) < 0) {
+        perror("connect");
+        close(sd);
+        return false;
+    }
+
+    // Отправка MSG_HELLO
+    if (send_msg(sd, MSG_HELLO, nick, (uint32_t)strlen(nick)) < 0) {
+        close(sd);
+        return false;
     }
     
     // Ожидание MSG_WELCOME
     Message msg{};
-    if (recv_msg(sock, &msg) < 0 || msg.type != MSG_WELCOME) {
-        close(sock);
-        return -1;
+    if (recv_msg(sd, &msg) < 0 || msg.type != MSG_WELCOME) {
+        close(sd);
+        return false;
     }
-    
-    return sock;
+
+    int old = g_sd.exchange(sd);
+    if (old >= 0) {
+        shutdown(old, SHUT_RDWR);
+        close(old);
+    }
+
+    pthread_mutex_lock(&print_mu);
+    std::cout << "Welcome " << msg.payload << std::endl;
+    pthread_mutex_unlock(&print_mu);
+    return true;
 }
 
-// Поток переподключения
-void* reconnect_thread(void *arg) {
-    (void)arg;
-    
-    while (client_running) {
-        if (!connected) {
-            std::cout << "\n[Attempting to reconnect...]" << std::endl;
-            
-            int sock = connect_to_server();
-            if (sock >= 0) {
-                pthread_mutex_lock(&socket_mutex);
-                
-                // Закрытие старого сокета если есть
-                int old_sock = client_socket.load();
-                if (old_sock >= 0) {
-                    close(old_sock);
-                }
-                
-                client_socket = sock;
-                pthread_mutex_unlock(&socket_mutex);
-                
-                connected = true;
-                std::cout << "[Reconnected successfully]" << std::endl;
-                std::cout << "> " << std::flush;
-            } else {
-                std::cout << "[Reconnect failed, retrying in " << RECONNECT_DELAY << "s...]" << std::endl;
-                sleep(RECONNECT_DELAY);
-            }
-        } else {
-            sleep(1);
-        }
-    }
-    
-    return nullptr;
-}
-
-int main() {
+int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
-    
-    std::cout << "TCP Client starting..." << std::endl;
-    
-    // Создание потока приёма сообщений
-    pthread_t recv_thread;
-    if (pthread_create(&recv_thread, nullptr, receive_thread, nullptr) != 0) {
-        std::cerr << "Failed to create receive thread" << std::endl;
+
+    const char *nick = "User";
+    const char *host = "127.0.0.1";
+    if (argc >= 2) nick = argv[1];
+    if (argc >= 3) host = argv[2];
+
+    // Создание потока приёма
+    pthread_t rt;
+    if (pthread_create(&rt, nullptr, recv_thread, (void*)nick) != 0) {
+        perror("pthread_create");
         return 1;
     }
-    pthread_detach(recv_thread);
-    
-    // Создание потока переподключения
-    pthread_t recon_thread;
-    if (pthread_create(&recon_thread, nullptr, reconnect_thread, nullptr) != 0) {
-        std::cerr << "Failed to create reconnect thread" << std::endl;
-        return 1;
-    }
-    pthread_detach(recon_thread);
-    
-    // Первая попытка подключения
-    std::cout << "[Connecting to server...]" << std::endl;
-    int sock = connect_to_server();
-    if (sock >= 0) {
-        client_socket = sock;
-        connected = true;
-        std::cout << "[Connected successfully]" << std::endl;
-    } else {
-        std::cout << "[Connection failed, will retry...]" << std::endl;
-    }
-    
-    // Основной цикл ввода
-    std::string line;
-    while (client_running) {
+
+    while (g_run.load()) {
+        // Цикл переподключения
+        while (g_sd.load() < 0 && g_run.load()) {
+            if (!do_connect(host, nick)) {
+                std::cerr << "retry in " << RECONNECT_SEC << " sec" << std::endl;
+                sleep(RECONNECT_SEC);
+            }
+        }
+        if (!g_run.load()) break;
+
+        // Ожидание ввода с timeout через poll()
+        for (;;) {
+            if (g_sd.load() < 0)
+                break;
+            struct pollfd p{};
+            p.fd = STDIN_FILENO;
+            p.events = POLLIN;
+            if (poll(&p, 1, 400) <= 0)
+                continue;
+            break;
+        }
+        if (g_sd.load() < 0)
+            continue;
+
+        // Чтение ввода
+        std::string line;
         std::cout << "> " << std::flush;
         if (!std::getline(std::cin, line)) {
+            int fd = g_sd.load();
+            if (fd >= 0)
+                send_msg(fd, MSG_BYE, nullptr, 0);
+            g_run.store(false);
             break;
         }
-        
-        if (line.empty()) {
+        if (line.empty())
             continue;
-        }
-        
-        pthread_mutex_lock(&socket_mutex);
-        int current_sock = client_socket.load();
-        pthread_mutex_unlock(&socket_mutex);
-        
-        if (!connected || current_sock < 0) {
-            std::cout << "[Not connected to server]" << std::endl;
+
+        int fd = g_sd.load();
+        if (fd < 0)
             continue;
-        }
-        
+
         if (line == "/ping") {
-            if (send_msg(current_sock, MSG_PING, nullptr, 0) < 0) {
-                std::cout << "[Failed to send PING]" << std::endl;
-                connected = false;
+            if (send_msg(fd, MSG_PING, nullptr, 0) < 0) {
+                shutdown(fd, SHUT_RDWR);
+                close(fd);
+                g_sd.store(-1);
             }
         } else if (line == "/quit") {
-            send_msg(current_sock, MSG_BYE, nullptr, 0);
-            std::cout << "[Disconnected]" << std::endl;
+            send_msg(fd, MSG_BYE, nullptr, 0);
+            g_run.store(false);
             break;
         } else {
-            uint32_t plen = line.size();
+            uint32_t plen = (uint32_t)line.size();
             if (plen > MAX_PAYLOAD - 1) plen = MAX_PAYLOAD - 1;
-            if (send_msg(current_sock, MSG_TEXT, line.c_str(), plen) < 0) {
-                std::cout << "[Failed to send message]" << std::endl;
-                connected = false;
+            if (send_msg(fd, MSG_TEXT, line.c_str(), plen) < 0) {
+                shutdown(fd, SHUT_RDWR);
+                close(fd);
+                g_sd.store(-1);
             }
         }
     }
-    
-    // Остановка
-    client_running = false;
-    
-    pthread_mutex_lock(&socket_mutex);
-    int sock_to_close = client_socket.load();
-    if (sock_to_close >= 0) {
-        close(sock_to_close);
+
+    // Очистка
+    int last = g_sd.load();
+    if (last >= 0) {
+        shutdown(last, SHUT_RDWR);
+        close(last);
+        g_sd.store(-1);
     }
-    client_socket = -1;
-    pthread_mutex_unlock(&socket_mutex);
-    
-    // Ожидание завершения потоков
-    sleep(1);
-    
-    std::cout << "[Client exited]" << std::endl;
-    
+    pthread_join(rt, nullptr);
     return 0;
 }
