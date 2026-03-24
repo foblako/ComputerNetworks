@@ -110,15 +110,12 @@ void* receive_thread(void *arg) {
         
         if (msg.type == MSG_TEXT) {
             std::cout << "\n" << msg.payload << std::endl;
-            std::cout << "> " << std::flush;
         } else if (msg.type == MSG_PONG) {
-            std::cout << "\n[PONG]" << std::endl;
-            std::cout << "> " << std::flush;
+            std::cout << "[PONG]" << std::endl;
         } else if (msg.type == MSG_WELCOME) {
-            std::cout << "\n[Connected to server: " << msg.payload << "]" << std::endl;
-            std::cout << "> " << std::flush;
+            std::cout << "[Connected to server: " << msg.payload << "]" << std::endl;
         } else if (msg.type == MSG_BYE) {
-            std::cout << "\n[Server sent BYE]" << std::endl;
+            std::cout << "[Server sent BYE]" << std::endl;
             connected = false;
         }
     }
