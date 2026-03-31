@@ -13,6 +13,7 @@
 
 #define MAX_PAYLOAD 1024
 #define RECONNECT_SEC 2
+#define SERVER_PORT 9090
 
 typedef struct {
     uint32_t length;
@@ -137,7 +138,7 @@ static bool do_connect(const char *host, const char *nick) {
     }
     sockaddr_in dest{};
     dest.sin_family = AF_INET;
-    dest.sin_port = htons(9090);
+    dest.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, host, &dest.sin_addr) != 1) {
         close(sd);
         return false;
@@ -153,7 +154,7 @@ static bool do_connect(const char *host, const char *nick) {
         close(sd);
         return false;
     }
-    
+
     // Ожидание MSG_WELCOME
     Message msg{};
     if (recv_msg(sd, &msg) < 0 || msg.type != MSG_WELCOME) {

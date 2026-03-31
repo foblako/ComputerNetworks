@@ -127,7 +127,7 @@ static void handle_session(int fd) {
     sockaddr_in peer{};
     socklen_t plen = sizeof(peer);
     char addrbuf[64];
-    
+
     if (getpeername(fd, (sockaddr*)&peer, &plen) == 0) {
         char ipstr[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
@@ -137,7 +137,7 @@ static void handle_session(int fd) {
     }
 
     Message msg{};
-    
+
     // Ожидание MSG_HELLO
     if (recv_msg(fd, &msg) < 0 || msg.type != MSG_HELLO) {
         close(fd);
@@ -174,7 +174,7 @@ static void handle_session(int fd) {
             remove_client(fd);
             return;
         }
-        
+
         if (msg.type == MSG_TEXT) {
             uint32_t tlen = msg.length > 1 ? msg.length - 1 : 0;
             std::string line = nick + " [" + addrbuf + "]: ";
@@ -215,7 +215,7 @@ int main() {
         perror("socket");
         return 1;
     }
-    
+
     int opt = 1;
     setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -229,7 +229,7 @@ int main() {
         close(sd);
         return 1;
     }
-    
+
     if (listen(sd, 32) < 0) {
         perror("listen");
         close(sd);
@@ -261,7 +261,7 @@ int main() {
             perror("accept");
             continue;
         }
-        
+
         pthread_mutex_lock(&q_mu);
         q.push(cd);
         pthread_cond_signal(&q_cv);
